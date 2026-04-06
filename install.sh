@@ -67,14 +67,36 @@ echo "📝 安裝設定範本..."
 download ".env.example" ".env.example.business-docs"
 
 # Merge settings.json
+HOOK_CMD="bash .claude/hooks/push-to-notion.sh"
 if [ -f ".claude/settings.json" ]; then
-  # 檢查是否已有 push-to-notion hook
   if ! grep -q "push-to-notion" .claude/settings.json 2>/dev/null; then
-    echo ""
-    echo "⚠️  請手動把以下 hook 設定加入 .claude/settings.json："
-    echo '    "PostToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "bash .claude/hooks/push-to-notion.sh"}]}]'
-    echo "  （參考 .claude/settings.kit.json）"
-    download ".claude/settings.kit.json" ".claude/settings.kit.json"
+    # 自動 merge hook 到既有 settings.json
+    python3 -c "
+import json, sys
+try:
+    with open('.claude/settings.json') as f:
+        s = json.load(f)
+except:
+    s = {}
+hooks = s.setdefault('hooks', {})
+post = hooks.setdefault('PostToolUse', [])
+# 找是否有 Bash matcher
+found = False
+for entry in post:
+    if entry.get('matcher') == 'Bash':
+        hs = entry.setdefault('hooks', [])
+        if not any('push-to-notion' in h.get('command','') for h in hs):
+            hs.append({'type': 'command', 'command': '$HOOK_CMD'})
+        found = True
+        break
+if not found:
+    post.append({'matcher': 'Bash', 'hooks': [{'type': 'command', 'command': '$HOOK_CMD'}]})
+with open('.claude/settings.json', 'w') as f:
+    json.dump(s, f, indent=2, ensure_ascii=False)
+    f.write('\n')
+" 2>/dev/null && echo "  ✅ .claude/settings.json（已 merge hook 設定）" || echo "  ⚠️  無法自動 merge settings.json，請手動加入 push-to-notion hook"
+  else
+    echo "  ⏭️  .claude/settings.json 已有 push-to-notion hook"
   fi
 else
   download ".claude/settings.kit.json" ".claude/settings.json"
