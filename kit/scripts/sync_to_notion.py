@@ -12,10 +12,13 @@ import sys
 import os
 import re
 import json
+import requests
 from pathlib import Path
 from datetime import datetime
 
 SYNC_FILE = '.business-docs-sync.json'
+NOTION_API = 'https://api.notion.com/v1'
+NOTION_VERSION = '2022-06-28'
 
 
 def check_env():
@@ -28,6 +31,14 @@ def check_env():
         print('❌ NOTION_DATABASE_ID 未設定')
         sys.exit(1)
     return token, db_id
+
+
+def headers(token):
+    return {
+        'Authorization': f'Bearer {token}',
+        'Notion-Version': NOTION_VERSION,
+        'Content-Type': 'application/json',
+    }
 
 
 def load_sync_state():
@@ -45,9 +56,7 @@ def save_sync_state(state):
 
 
 def parse_metadata(content):
-    """從 markdown 提取 metadata"""
     meta = {}
-
     title_match = re.search(r'^# (.+)$', content, re.MULTILINE)
     meta['title'] = title_match.group(1) if title_match else '未命名'
 
@@ -64,11 +73,9 @@ def parse_metadata(content):
 
 
 def md_to_notion_blocks(content):
-    """簡化 markdown → Notion blocks 轉換（只支援 H2、段落、清單）"""
     blocks = []
     lines = content.split('\n')
 
-    # 跳過 metadata 區（到第一個 ## 之前）
     start = 0
     for i, line in enumerate(lines):
         if line.startswith('## '):
@@ -79,7 +86,6 @@ def md_to_notion_blocks(content):
     while i < len(lines):
         line = lines[i]
 
-        # 跳過 HTML 註解
         if line.strip().startswith('<!--'):
             while i < len(lines) and '-->' not in lines[i]:
                 i += 1
@@ -113,24 +119,24 @@ def md_to_notion_blocks(content):
     return blocks
 
 
-def find_existing_page(client, db_id, title):
-    """在 Database 中找到同名 page"""
-    results = client.databases.query(
-        database_id=db_id,
-        filter={'property': 'Title', 'title': {'equals': title}}
+def find_existing_page(token, db_id, title):
+    resp = requests.post(
+        f'{NOTION_API}/databases/{db_id}/query',
+        headers=headers(token),
+        json={'filter': {'property': 'Title', 'title': {'equals': title}}}
     )
-    if results['results']:
-        return results['results'][0]['id']
+    data = resp.json()
+    if data.get('results'):
+        return data['results'][0]['id']
     return None
 
 
-def sync_file(client, db_id, filepath, sync_state):
+def sync_file(token, db_id, filepath, sync_state):
     path = Path(filepath)
     content = path.read_text(encoding='utf-8')
     meta = parse_metadata(content)
     blocks = md_to_notion_blocks(content)
 
-    # 建立 properties
     properties = {
         'Title': {'title': [{'text': {'content': meta['title']}}]},
         '一句話': {'rich_text': [{'text': {'content': meta['oneliner']}}]},
@@ -140,25 +146,43 @@ def sync_file(client, db_id, filepath, sync_state):
     if meta['last_updated']:
         properties['最後更新'] = {'date': {'start': meta['last_updated']}}
 
-    # 檢查是否已有對應 page
     page_id = sync_state.get(str(filepath), {}).get('notion_page_id')
 
     if not page_id:
-        page_id = find_existing_page(client, db_id, meta['title'])
+        page_id = find_existing_page(token, db_id, meta['title'])
 
     if page_id:
         # 更新既有 page
         try:
-            client.pages.update(page_id=page_id, properties=properties)
-            # 清除舊 blocks 再新增
-            existing = client.blocks.children.list(block_id=page_id)
-            for block in existing['results']:
+            requests.patch(
+                f'{NOTION_API}/pages/{page_id}',
+                headers=headers(token),
+                json={'properties': properties}
+            ).raise_for_status()
+
+            # 清除舊 blocks
+            existing = requests.get(
+                f'{NOTION_API}/blocks/{page_id}/children',
+                headers=headers(token)
+            ).json()
+            for block in existing.get('results', []):
                 try:
-                    client.blocks.delete(block_id=block['id'])
+                    requests.delete(
+                        f'{NOTION_API}/blocks/{block["id"]}',
+                        headers=headers(token)
+                    )
                 except Exception:
                     pass
-            if blocks:
-                client.blocks.children.append(block_id=page_id, children=blocks)
+
+            # 新增 blocks（每次最多 100）
+            for chunk_start in range(0, len(blocks), 100):
+                chunk = blocks[chunk_start:chunk_start + 100]
+                requests.patch(
+                    f'{NOTION_API}/blocks/{page_id}/children',
+                    headers=headers(token),
+                    json={'children': chunk}
+                ).raise_for_status()
+
             action = '更新'
         except Exception as e:
             print(f'  ❌ 更新失敗: {e}')
@@ -166,18 +190,33 @@ def sync_file(client, db_id, filepath, sync_state):
     else:
         # 新建 page
         try:
-            page = client.pages.create(
-                parent={'database_id': db_id},
-                properties=properties,
-                children=blocks
+            resp = requests.post(
+                f'{NOTION_API}/pages',
+                headers=headers(token),
+                json={
+                    'parent': {'database_id': db_id},
+                    'properties': properties,
+                    'children': blocks[:100],  # 建立時最多 100 blocks
+                }
             )
+            resp.raise_for_status()
+            page = resp.json()
             page_id = page['id']
+
+            # 若超過 100 blocks，補上剩餘
+            for chunk_start in range(100, len(blocks), 100):
+                chunk = blocks[chunk_start:chunk_start + 100]
+                requests.patch(
+                    f'{NOTION_API}/blocks/{page_id}/children',
+                    headers=headers(token),
+                    json={'children': chunk}
+                ).raise_for_status()
+
             action = '新建'
         except Exception as e:
             print(f'  ❌ 新建失敗: {e}')
             return None
 
-    # 更新 sync state
     notion_url = f'https://notion.so/{page_id.replace("-", "")}'
     sync_state[str(filepath)] = {
         'notion_page_id': page_id,
@@ -192,15 +231,6 @@ def sync_file(client, db_id, filepath, sync_state):
 def main():
     token, db_id = check_env()
 
-    try:
-        from notion_client import Client
-    except ImportError:
-        print('❌ 請先安裝 notion-client: pip3 install notion-client')
-        sys.exit(1)
-
-    client = Client(auth=token)
-
-    # 收集要推送的檔案
     if len(sys.argv) < 2 or sys.argv[1] == '--all':
         files = sorted(Path('docs/business').glob('*.md'))
         files = [f for f in files if f.name != 'README.md' and not f.name.startswith('_')]
@@ -209,7 +239,6 @@ def main():
         for arg in sys.argv[1:]:
             p = Path(arg)
             if not p.exists():
-                # 嘗試補全路徑
                 p = Path(f'docs/business/{arg}.md')
             if p.exists():
                 files.append(p)
@@ -226,7 +255,7 @@ def main():
     success = 0
 
     for f in files:
-        result = sync_file(client, db_id, f, sync_state)
+        result = sync_file(token, db_id, f, sync_state)
         if result:
             success += 1
 
