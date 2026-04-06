@@ -72,49 +72,126 @@ def parse_metadata(content):
     return meta
 
 
-def md_to_notion_blocks(content):
+SECTION_ICONS = {
+    '為什麼需要這個': '💡',
+    '使用者怎麼用': '👤',
+    '關鍵規則': '📏',
+    '為什麼這樣設計': '🏗️',
+    '會碰到的狀況': '⚠️',
+    '不做什麼': '🚫',
+}
+
+
+def parse_rich_text(text):
+    """把 markdown 粗體 **text** 轉成 Notion rich_text annotations"""
+    parts = re.split(r'(\*\*[^*]+\*\*)', text)
+    rich = []
+    for part in parts:
+        if part.startswith('**') and part.endswith('**'):
+            rich.append({
+                'type': 'text',
+                'text': {'content': part[2:-2]},
+                'annotations': {'bold': True}
+            })
+        elif part:
+            rich.append({
+                'type': 'text',
+                'text': {'content': part}
+            })
+    return rich if rich else [{'type': 'text', 'text': {'content': text}}]
+
+
+def md_to_notion_blocks(content, meta):
     blocks = []
+
+    # Callout: metadata 摘要
+    callout_text = f"📌 {meta['oneliner']}" if meta['oneliner'] else '📌 （缺一句話描述）'
+    callout_parts = [callout_text]
+    if meta['category']:
+        callout_parts.append(f"分類：{meta['category']}")
+    if meta['last_updated']:
+        callout_parts.append(f"最後更新：{meta['last_updated']}")
+    blocks.append({
+        'type': 'callout',
+        'callout': {
+            'icon': {'type': 'emoji', 'emoji': '📋'},
+            'rich_text': [{'type': 'text', 'text': {'content': '\n'.join(callout_parts)}}],
+            'color': 'blue_background'
+        }
+    })
+    blocks.append({'type': 'divider', 'divider': {}})
+
     lines = content.split('\n')
 
+    # 找到第一個 ## 開始
     start = 0
-    for i, line in enumerate(lines):
+    for idx, line in enumerate(lines):
         if line.startswith('## '):
-            start = i
+            start = idx
             break
 
-    i = start
-    while i < len(lines):
-        line = lines[i]
+    # 先把內容按 ## 切成 sections
+    sections = []
+    current_title = None
+    current_lines = []
 
-        if line.strip().startswith('<!--'):
-            while i < len(lines) and '-->' not in lines[i]:
-                i += 1
-            i += 1
-            continue
-
+    for idx in range(start, len(lines)):
+        line = lines[idx]
         if line.startswith('## '):
-            blocks.append({
-                'type': 'heading_2',
-                'heading_2': {
-                    'rich_text': [{'type': 'text', 'text': {'content': line[3:].strip()}}]
-                }
-            })
-        elif line.startswith('- '):
-            blocks.append({
-                'type': 'bulleted_list_item',
-                'bulleted_list_item': {
-                    'rich_text': [{'type': 'text', 'text': {'content': line[2:].strip()}}]
-                }
-            })
-        elif line.strip():
-            blocks.append({
-                'type': 'paragraph',
-                'paragraph': {
-                    'rich_text': [{'type': 'text', 'text': {'content': line.strip()}}]
-                }
-            })
+            if current_title is not None:
+                sections.append((current_title, current_lines))
+            current_title = line[3:].strip()
+            current_lines = []
+        else:
+            current_lines.append(line)
+    if current_title is not None:
+        sections.append((current_title, current_lines))
 
-        i += 1
+    # 每個 section 做成 toggle heading
+    for title, section_lines in sections:
+        icon = SECTION_ICONS.get(title, '📝')
+        # 收集 children blocks
+        children = []
+        for line in section_lines:
+            # 跳過 HTML 註解
+            if line.strip().startswith('<!--'):
+                while section_lines and '-->' not in line:
+                    idx = section_lines.index(line) + 1 if line in section_lines else len(section_lines)
+                    break
+                continue
+            if '-->' in line:
+                continue
+
+            if line.startswith('- '):
+                children.append({
+                    'type': 'bulleted_list_item',
+                    'bulleted_list_item': {
+                        'rich_text': parse_rich_text(line[2:].strip())
+                    }
+                })
+            elif line.strip():
+                children.append({
+                    'type': 'paragraph',
+                    'paragraph': {
+                        'rich_text': parse_rich_text(line.strip())
+                    }
+                })
+
+        # Divider before each section (except first)
+        if sections.index((title, section_lines)) > 0:
+            blocks.append({'type': 'divider', 'divider': {}})
+
+        # Toggle heading
+        blocks.append({
+            'type': 'heading_2',
+            'heading_2': {
+                'rich_text': [{'type': 'text', 'text': {'content': f'{icon} {title}'}}],
+                'is_toggleable': True,
+                'children': children if children else [
+                    {'type': 'paragraph', 'paragraph': {'rich_text': [{'type': 'text', 'text': {'content': '（待填寫）'}}]}}
+                ]
+            }
+        })
 
     return blocks
 
@@ -135,7 +212,7 @@ def sync_file(token, db_id, filepath, sync_state):
     path = Path(filepath)
     content = path.read_text(encoding='utf-8')
     meta = parse_metadata(content)
-    blocks = md_to_notion_blocks(content)
+    blocks = md_to_notion_blocks(content, meta)
 
     properties = {
         'Title': {'title': [{'text': {'content': meta['title']}}]},
