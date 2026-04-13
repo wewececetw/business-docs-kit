@@ -72,18 +72,49 @@ echo "📝 安裝設定範本..."
 download ".env.example" ".env.example.business-docs"
 
 # Merge settings.json
+HOOK_CMD="bash .claude/hooks/push-to-notion.sh"
 if [ -f ".claude/settings.json" ]; then
-  # 檢查是否已有 push-to-notion hook
-  if ! grep -q "push-to-notion" .claude/settings.json 2>/dev/null; then
-    echo ""
-    echo "⚠️  請手動把 hook 設定合併到 .claude/settings.json"
-    echo "  （參考 .claude/settings.kit.json）"
-    download ".claude/settings.kit.json" ".claude/settings.kit.json"
-  elif ! grep -q "business-docs-hook" .claude/settings.json 2>/dev/null; then
-    echo ""
-    echo "⚠️  新增了 business-docs-hook，請手動合併到 .claude/settings.json"
-    echo "  （參考 .claude/settings.kit.json）"
-    download ".claude/settings.kit.json" ".claude/settings.kit.json"
+  if ! grep -q "push-to-notion" .claude/settings.json 2>/dev/null || ! grep -q "business-docs-hook" .claude/settings.json 2>/dev/null; then
+    # 自動 merge 所有 hook 到既有 settings.json
+    python3 -c "
+import json
+try:
+    with open('.claude/settings.json') as f:
+        s = json.load(f)
+except:
+    s = {}
+hooks = s.setdefault('hooks', {})
+post = hooks.setdefault('PostToolUse', [])
+
+# 要確保的 hook 列表
+required_hooks = {
+    'Bash': [
+        'bash .claude/hooks/push-to-notion.sh',
+        'bash .claude/hooks/business-docs-hook.sh',
+    ],
+    'Edit': ['bash .claude/hooks/business-docs-hook.sh'],
+    'Write': ['bash .claude/hooks/business-docs-hook.sh'],
+}
+
+for matcher, cmds in required_hooks.items():
+    entry = next((e for e in post if e.get('matcher') == matcher), None)
+    if not entry:
+        entry = {'matcher': matcher, 'hooks': []}
+        post.append(entry)
+    hs = entry.setdefault('hooks', [])
+    for cmd in cmds:
+        if not any(cmd in h.get('command', '') for h in hs):
+            hs.append({'type': 'command', 'command': cmd})
+
+with open('.claude/settings.json', 'w') as f:
+    json.dump(s, f, indent=2, ensure_ascii=False)
+    f.write('\n')
+" 2>/dev/null && echo "  ✅ .claude/settings.json（已 merge hook 設定）" || {
+      echo "  ⚠️  無法自動 merge，請手動合併 .claude/settings.kit.json"
+      download ".claude/settings.kit.json" ".claude/settings.kit.json"
+    }
+  else
+    echo "  ⏭️  .claude/settings.json 已有所有 hook"
   fi
 else
   download ".claude/settings.kit.json" ".claude/settings.json"
