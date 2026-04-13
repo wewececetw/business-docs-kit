@@ -21,7 +21,25 @@ NOTION_API = 'https://api.notion.com/v1'
 NOTION_VERSION = '2022-06-28'
 
 
+def load_dotenv():
+    """從 .env 檔讀取環境變數（不依賴 python-dotenv）"""
+    for env_file in ['.env', '.env.local', '.env.business-docs']:
+        path = Path(env_file)
+        if path.exists():
+            for line in path.read_text(encoding='utf-8').splitlines():
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                if '=' in line:
+                    key, _, value = line.partition('=')
+                    key = key.strip()
+                    value = value.strip().strip('"').strip("'")
+                    if key and not os.environ.get(key):
+                        os.environ[key] = value
+
+
 def check_env():
+    load_dotenv()
     token = os.environ.get('NOTION_TOKEN')
     db_id = os.environ.get('NOTION_DATABASE_ID')
     if not token:
