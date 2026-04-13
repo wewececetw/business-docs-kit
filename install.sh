@@ -28,7 +28,7 @@ if [ -f "docs/business/_template.md" ] && [ -f ".claude/hooks/push-to-notion.sh"
 fi
 
 # 建立目錄
-mkdir -p .claude/hooks .claude/commands docs/business scripts
+mkdir -p .claude/hooks .claude/commands docs/business scripts .github/workflows
 
 # 下載檔案（不覆蓋既有）
 download() {
@@ -50,9 +50,10 @@ download "docs/business/_template.md" "docs/business/_template.md"
 download "docs/business/README.md" "docs/business/README.md"
 
 echo ""
-echo "🤖 安裝 Claude Code 設定..."
+echo "🤖 安裝 Claude Code Hooks..."
 download ".claude/hooks/push-to-notion.sh" ".claude/hooks/push-to-notion.sh" true
-chmod +x .claude/hooks/push-to-notion.sh
+download ".claude/hooks/business-docs-hook.sh" ".claude/hooks/business-docs-hook.sh" true
+chmod +x .claude/hooks/push-to-notion.sh .claude/hooks/business-docs-hook.sh
 download ".claude/commands/new-doc.md" ".claude/commands/new-doc.md" true
 download ".claude/commands/push-docs.md" ".claude/commands/push-docs.md" true
 
@@ -63,16 +64,20 @@ download "scripts/validate_doc.py" "scripts/validate_doc.py" true
 chmod +x scripts/sync_to_notion.py scripts/validate_doc.py
 
 echo ""
+echo "📢 安裝 GitHub Actions 模板..."
+download ".github/workflows/notify-slack.yml" ".github/workflows/notify-slack.yml"
+
+echo ""
 echo "📝 安裝設定範本..."
 download ".env.example" ".env.example.business-docs"
 
 # Merge settings.json
 HOOK_CMD="bash .claude/hooks/push-to-notion.sh"
 if [ -f ".claude/settings.json" ]; then
-  if ! grep -q "push-to-notion" .claude/settings.json 2>/dev/null; then
-    # 自動 merge hook 到既有 settings.json
+  if ! grep -q "push-to-notion" .claude/settings.json 2>/dev/null || ! grep -q "business-docs-hook" .claude/settings.json 2>/dev/null; then
+    # 自動 merge 所有 hook 到既有 settings.json
     python3 -c "
-import json, sys
+import json
 try:
     with open('.claude/settings.json') as f:
         s = json.load(f)
@@ -80,23 +85,36 @@ except:
     s = {}
 hooks = s.setdefault('hooks', {})
 post = hooks.setdefault('PostToolUse', [])
-# 找是否有 Bash matcher
-found = False
-for entry in post:
-    if entry.get('matcher') == 'Bash':
-        hs = entry.setdefault('hooks', [])
-        if not any('push-to-notion' in h.get('command','') for h in hs):
-            hs.append({'type': 'command', 'command': '$HOOK_CMD'})
-        found = True
-        break
-if not found:
-    post.append({'matcher': 'Bash', 'hooks': [{'type': 'command', 'command': '$HOOK_CMD'}]})
+
+# 要確保的 hook 列表
+required_hooks = {
+    'Bash': [
+        'bash .claude/hooks/push-to-notion.sh',
+        'bash .claude/hooks/business-docs-hook.sh',
+    ],
+    'Edit': ['bash .claude/hooks/business-docs-hook.sh'],
+    'Write': ['bash .claude/hooks/business-docs-hook.sh'],
+}
+
+for matcher, cmds in required_hooks.items():
+    entry = next((e for e in post if e.get('matcher') == matcher), None)
+    if not entry:
+        entry = {'matcher': matcher, 'hooks': []}
+        post.append(entry)
+    hs = entry.setdefault('hooks', [])
+    for cmd in cmds:
+        if not any(cmd in h.get('command', '') for h in hs):
+            hs.append({'type': 'command', 'command': cmd})
+
 with open('.claude/settings.json', 'w') as f:
     json.dump(s, f, indent=2, ensure_ascii=False)
     f.write('\n')
-" 2>/dev/null && echo "  ✅ .claude/settings.json（已 merge hook 設定）" || echo "  ⚠️  無法自動 merge settings.json，請手動加入 push-to-notion hook"
+" 2>/dev/null && echo "  ✅ .claude/settings.json（已 merge hook 設定）" || {
+      echo "  ⚠️  無法自動 merge，請手動合併 .claude/settings.kit.json"
+      download ".claude/settings.kit.json" ".claude/settings.kit.json"
+    }
   else
-    echo "  ⏭️  .claude/settings.json 已有 push-to-notion hook"
+    echo "  ⏭️  .claude/settings.json 已有所有 hook"
   fi
 else
   download ".claude/settings.kit.json" ".claude/settings.json"
@@ -105,14 +123,19 @@ fi
 echo ""
 echo "✅ 安裝完成！"
 echo ""
+echo "已安裝的功能："
+echo "  📄 /new-doc — 建立新商業文件"
+echo "  📤 /push-docs — 推送文件到 Notion"
+echo "  🔔 business-docs-hook — 程式碼修改時自動提醒更新文件"
+echo "  📢 notify-slack.yml — PR/Issue 推送 Slack 通知"
+echo ""
 echo "下一步："
 echo "  1. 在 Claude Code 裡用 /new-doc <功能名> 建立第一份文件"
-echo "  2. （選配）設定 Notion 同步："
-echo "     - 到 https://www.notion.so/my-integrations 建 Integration"
-echo "     - 在 Notion 建 Database（欄位：Title, 一句話, 分類, 最後更新, 檔案路徑）"
-echo "     - 分享 Database 給 Integration"
+echo "  2. （選配）Slack 通知："
+echo "     - 到 GitHub repo Settings → Secrets 加入 SLACK_WEBHOOK_URL"
+echo "  3. （選配）Notion 同步："
 echo "     - export NOTION_TOKEN=secret_xxx"
 echo "     - export NOTION_DATABASE_ID=xxx"
-echo "  3. pip3 install notion-client（若要用 Notion 同步）"
+echo "     - pip3 install notion-client"
 echo ""
 echo "📖 規則說明：docs/business/README.md"
